@@ -1,0 +1,15 @@
+{
+  "name": "mimic-revenue-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "deploy:commands": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "googleapis": "^140.0.0",
+    "luxon": "^3.5.0"
+  }
+}
