@@ -13,6 +13,10 @@ const {
   updateStatusAndAmounts
 } = require("./google/sheets");
 
+// ✅ OCR 추가
+const { ocrFromImageUrl } = require("./google/vision");
+const { extractFieldsFromOcrTexts } = require("./ocr/parse");
+
 // ===== ENV =====
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const SHEET_ID = process.env.SHEET_ID;
@@ -37,7 +41,6 @@ function todayISO() {
 }
 
 function validateBizDate(str) {
-  // YYYY-MM-DD
   return /^\d{4}-\d{2}-\d{2}$/.test(str);
 }
 
@@ -61,7 +64,14 @@ function buildButtons(reportId) {
   );
 }
 
-function buildEmbed({ branch, bizDate, reporterTag, photo1, photo2, photo3, status, memo, salesTotal, closingCash, delta }) {
+function buildEmbed({
+  branch, bizDate, reporterTag,
+  photo1, photo2, photo3,
+  status, memo,
+  salesTotal, closingCash, delta,
+  ocrConfidence,
+  ocrNote
+}) {
   const e = new EmbedBuilder()
     .setTitle("매출 보고 접수")
     .addFields(
@@ -73,6 +83,13 @@ function buildEmbed({ branch, bizDate, reporterTag, photo1, photo2, photo3, stat
       { name: "마감시재", value: `₩ ${won(closingCash)}`, inline: true },
       { name: "오차", value: `₩ ${won(delta)}`, inline: true }
     );
+
+  if (typeof ocrConfidence === "number") {
+    e.addFields({ name: "OCR 신뢰도", value: `${Math.round(ocrConfidence * 100)}%`, inline: true });
+  }
+  if (ocrNote) {
+    e.addFields({ name: "OCR 메모", value: ocrNote, inline: false });
+  }
 
   if (memo) e.addFields({ name: "메모", value: memo, inline: false });
 
@@ -86,12 +103,34 @@ function buildEmbed({ branch, bizDate, reporterTag, photo1, photo2, photo3, stat
   return e;
 }
 
+async function runOcrFor3Photos(photoUrls) {
+  const urls = (photoUrls || []).filter(Boolean);
+  if (urls.length !== 3) throw new Error("사진 URL 3개가 필요합니다.");
+
+  // 병렬 OCR
+  const texts = await Promise.all(urls.map(u => ocrFromImageUrl(u).then(r => r.text)));
+  const { salesTotal, closingCash, delta, confidence } = extractFieldsFromOcrTexts(texts);
+
+  // 운영상 방어: 값이 모두 0이면 OCR 실패로 간주
+  const allZero = (Number(salesTotal) === 0 && Number(closingCash) === 0 && Number(delta) === 0);
+  const note =
+    allZero ? "OCR 결과가 모두 0입니다. (검수/수정 권장)" :
+    confidence < 0.67 ? "OCR 신뢰도가 낮습니다. (검수/수정 권장)" :
+    "OCR 자동 추출 완료";
+
+  return { salesTotal, closingCash, delta, confidence, note };
+}
+
 async function upsertPendingFromCommand(interaction) {
+  // OCR 때문에 응답 지연될 수 있어 defer
+  await interaction.deferReply();
+
   const branch = interaction.options.getString("branch", true);
   const bizDateInput = interaction.options.getString("biz_date", false);
   const bizDate = bizDateInput ? bizDateInput : todayISO();
+
   if (!validateBizDate(bizDate)) {
-    await interaction.reply({ content: "biz_date 형식이 올바르지 않습니다. 예: 2026-01-31", ephemeral: true });
+    await interaction.editReply({ content: "biz_date 형식이 올바르지 않습니다. 예: 2026-01-31" });
     return;
   }
 
@@ -101,20 +140,36 @@ async function upsertPendingFromCommand(interaction) {
   const memo = interaction.options.getString("memo", false) || "";
 
   const reporterTag = `${interaction.user.username}#${interaction.user.discriminator}`;
-  const reportId = String(interaction.id); // 고유 ID
+  const reportId = String(interaction.id);
 
-  // 1차 MVP: OCR 전이므로 금액은 0으로 접수
-  const salesTotal = 0;
-  const cardSales = 0;
-  const cashSales = 0;
-  const otherSales = 0;
-  const closingCash = 0;
-  const delta = 0;
+  // 1차 MVP: 카드/현금/기타 분해는 아직 0 유지
+  let salesTotal = 0;
+  let cardSales = 0;
+  let cashSales = 0;
+  let otherSales = 0;
+  let closingCash = 0;
+  let delta = 0;
 
-  const confirmedAt = ""; // 확정 시에 넣는다
+  let ocrConfidence = null;
+  let ocrNote = "";
+
+  // ✅ OCR 실행 (실패해도 접수는 진행)
+  try {
+    const r = await runOcrFor3Photos([photo1, photo2, photo3]);
+    salesTotal = r.salesTotal;
+    closingCash = r.closingCash;
+    delta = r.delta;
+    ocrConfidence = r.confidence;
+    ocrNote = r.note;
+  } catch (e) {
+    console.error("OCR 실패:", e);
+    ocrNote = `OCR 실패: ${e.message}`;
+  }
+
+  const confirmedAt = "";
   const status = "PENDING";
 
-  // A~O row 구성
+  // A~O row 구성 (현재 시트 구조 유지)
   const row = [
     bizDate,        // A 영업일자
     branch,         // B 지점
@@ -147,11 +202,12 @@ async function upsertPendingFromCommand(interaction) {
     photo1, photo2, photo3,
     status,
     memo,
-    salesTotal, closingCash, delta
+    salesTotal, closingCash, delta,
+    ocrConfidence,
+    ocrNote
   });
 
-  // 메시지를 채널에 남기고 버튼 제공
-  await interaction.reply({
+  await interaction.editReply({
     embeds: [embed],
     components: [buildButtons(reportId)]
   });
@@ -163,9 +219,6 @@ async function handleStatusButton(interaction, mode) {
     return;
   }
 
-  const [_, action, reportId] = interaction.customId.split(":"); // rev:ok:REPORTID
-  // reportId로 행 찾는 대신, 업서트 키가 (영업일자, 지점)이므로
-  // 여기서는 embed에서 지점/영업일자를 읽어온다(메시지에 이미 있음).
   const msg = interaction.message;
   const embed = msg.embeds?.[0];
   if (!embed) {
@@ -188,6 +241,8 @@ async function handleStatusButton(interaction, mode) {
     mode === "review" ? "NEEDS_REVIEW" :
     mode === "reshoot" ? "RESHOOT" : "PENDING";
 
+  const reportId = interaction.customId.split(":")[2];
+
   await updateStatusAndAmounts({
     sheetId: SHEET_ID,
     sheetName: RAW_SHEET_NAME,
@@ -197,25 +252,11 @@ async function handleStatusButton(interaction, mode) {
     patch: { status, confirmedAt, reportId }
   });
 
-  // Embed 상태 업데이트
   const newEmbed = EmbedBuilder.from(embed);
-  // 상태 field 갱신
-  const newFields = fields.map(f => {
-    if (f.name === "상태") return { ...f, value: status };
-    return f;
-  });
+  const newFields = fields.map(f => (f.name === "상태" ? { ...f, value: status } : f));
   newEmbed.setFields(newFields);
 
-  // RESHOOT이면 보고자에게 알림(메시지 내 보고자 field 기반)
-  if (mode === "reshoot") {
-    // 보고자 tag는 user#0000이므로 멘션으로 정확히 못 잡음.
-    // 2차에서 reporter의 userId도 저장하는 방식으로 개선 가능.
-    // 현재는 채널에 안내만 남김.
-    await interaction.reply({ content: `🔴 재촬영 요청 처리 완료: ${branch} / ${bizDate}`, ephemeral: true });
-  } else {
-    await interaction.reply({ content: `✅ 상태 업데이트: ${status}`, ephemeral: true });
-  }
-
+  await interaction.reply({ content: `✅ 상태 업데이트: ${status}`, ephemeral: true });
   await msg.edit({ embeds: [newEmbed] });
 }
 
@@ -231,6 +272,7 @@ async function handleEditButton(interaction) {
     await interaction.reply({ content: "원본 보고 Embed를 찾지 못했습니다.", ephemeral: true });
     return;
   }
+
   const fields = embed.fields || [];
   const branch = fields.find(f => f.name === "지점")?.value;
   const bizDate = fields.find(f => f.name === "영업일자")?.value;
@@ -244,7 +286,6 @@ async function handleEditButton(interaction) {
     .setCustomId(`rev:modal_edit:${branch}:${bizDate}`)
     .setTitle("금액 수정(숫자만 입력)");
 
-  // 숫자만 입력하도록 안내 (검증은 서버에서)
   const salesInput = new TextInputBuilder()
     .setCustomId("salesTotal")
     .setLabel("실매출액 (예: 380000)")
@@ -273,7 +314,6 @@ async function handleEditButton(interaction) {
 }
 
 function parseIntSafe(s) {
-  // 콤마/원/공백 제거
   const cleaned = String(s).replace(/[,\s₩원]/g, "");
   if (!/^[-]?\d+$/.test(cleaned)) return null;
   return Number(cleaned);
@@ -285,7 +325,7 @@ async function handleEditModalSubmit(interaction) {
     return;
   }
 
-  const parts = interaction.customId.split(":"); // rev:modal_edit:branch:bizDate
+  const parts = interaction.customId.split(":");
   const branch = parts[2];
   const bizDate = parts[3];
 
@@ -299,7 +339,7 @@ async function handleEditModalSubmit(interaction) {
   }
 
   const confirmedAt = DateTime.now().setZone(TZ).toFormat("yyyy-LL-dd HH:mm:ss");
-  const status = "NEEDS_REVIEW"; // 수정 후엔 검수 상태로 두는 게 안전
+  const status = "NEEDS_REVIEW";
 
   await updateStatusAndAmounts({
     sheetId: SHEET_ID,
@@ -314,9 +354,6 @@ async function handleEditModalSubmit(interaction) {
     content: `✏️ 수정 반영 완료: ${branch} / ${bizDate}\n- 실매출: ₩${won(salesTotal)}\n- 시재: ₩${won(closingCash)}\n- 오차: ₩${won(delta)}\n상태: ${status}`,
     ephemeral: true
   });
-
-  // 메시지 Embed도 업데이트(가능하면)
-  const msg = interaction.message; // 모달 submit에선 message가 없을 수 있음
 }
 
 client.on("ready", () => {
@@ -325,13 +362,11 @@ client.on("ready", () => {
 
 client.on("interactionCreate", async (interaction) => {
   try {
-    // /매출보고
     if (interaction.isChatInputCommand() && interaction.commandName === "매출보고") {
       await upsertPendingFromCommand(interaction);
       return;
     }
 
-    // 버튼
     if (interaction.isButton()) {
       const id = interaction.customId;
       if (id.startsWith("rev:ok:")) return await handleStatusButton(interaction, "ok");
@@ -340,7 +375,6 @@ client.on("interactionCreate", async (interaction) => {
       if (id.startsWith("rev:edit:")) return await handleEditButton(interaction);
     }
 
-    // 모달
     if (interaction.type === InteractionType.ModalSubmit) {
       if (interaction.customId.startsWith("rev:modal_edit:")) {
         return await handleEditModalSubmit(interaction);
@@ -348,10 +382,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (err) {
     console.error(err);
-    if (interaction.deferred || interaction.replied) {
-      // 이미 응답된 경우
-      return;
-    }
+    if (interaction.deferred || interaction.replied) return;
     await interaction.reply({ content: `에러: ${err.message}`, ephemeral: true });
   }
 });
